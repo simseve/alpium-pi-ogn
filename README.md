@@ -7,7 +7,7 @@ only when they are signed by Alpium.
 
 ```bash
 sudo apt-get install -y git
-sudo git clone https://github.com/simseve/hfss-pi-flarm-rx /home/hfss/hfss-pi-flarm-rx
+sudo git clone https://github.com/simseve/alpium-pi-ogn /home/hfss/hfss-pi-flarm-rx
 cd /home/hfss/hfss-pi-flarm-rx
 sudo ./install.sh --code OGN-XXXX-XXXX-XXXX-XXXX --callsign MYSITE --lat 46.01 --lon 8.91 --alt 1250
 ```

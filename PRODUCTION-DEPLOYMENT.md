@@ -111,7 +111,7 @@ Nothing secret is on the card; an unapproved Pi gets nothing.
 
 ```bash
 sudo apt-get install -y git
-sudo git clone https://github.com/simseve/hfss-pi-flarm-rx /home/hfss/hfss-pi-flarm-rx
+sudo git clone https://github.com/simseve/alpium-pi-ogn /home/hfss/hfss-pi-flarm-rx
 cd /home/hfss/hfss-pi-flarm-rx
 sudo ./install.sh --code OGN-XXXX-XXXX-XXXX-XXXX \
      --callsign MYSITE --lat 46.0123 --lon 8.9123 --alt 1250
@@ -274,7 +274,7 @@ Lite 64-bit, checksum-verified, plus this release installed with
 `alpium-ogn-station-X.Y.Z.img.xz` with `image-info.json`. Follow it with:
 
 ```bash
-gh run list --repo simseve/hfss-pi-flarm-rx --workflow station-image.yml --limit 1
+gh run list --repo simseve/alpium-pi-ogn --workflow station-image.yml --limit 1
 ```
 
 **4. Sign the image (about 5 seconds)**
@@ -304,7 +304,7 @@ Downloads only `image-info.json` (never the 700 MB image), signs a
 | `Working tree not clean` | A local change or `.DS_Store`: commit, or `rm -f .DS_Store` |
 | `Tag vX.Y.Z exists` | That version was released already: bump `AGENT_VERSION` |
 | `No image-info.json on vX.Y.Z yet` | The image is still building (step 3): wait, sign again |
-| The image workflow failed | Read it: `gh run view <id> --repo simseve/hfss-pi-flarm-rx --log-failed`. Fix the build on `main` and rebuild the SAME release without a new version: `gh workflow run station-image.yml --repo simseve/hfss-pi-flarm-rx -f tag=vX.Y.Z` (the script comes from `main`, the image content from the tag) |
+| The image workflow failed | Read it: `gh run view <id> --repo simseve/alpium-pi-ogn --log-failed`. Fix the build on `main` and rebuild the SAME release without a new version: `gh workflow run station-image.yml --repo simseve/alpium-pi-ogn -f tag=vX.Y.Z` (the script comes from `main`, the image content from the tag) |
 | A station refuses the update | `Release signature does not verify` (wrong key) or `not newer` (version) in its update log, Manage, Status |
 
 **If the key is lost or leaked**
