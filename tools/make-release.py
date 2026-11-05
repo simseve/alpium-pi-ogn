@@ -47,6 +47,8 @@ def git(*args):
 
 
 IMAGE_CONTEXT = b"alpium-ogn-image-v1\n"
+# File suffix -> the signed "variant" field (none for the normal image).
+IMAGE_VARIANTS = {"": None, "-readonly": "readonly"}
 
 
 def load_key(path):
@@ -58,18 +60,39 @@ def load_key(path):
 
 
 def sign_image(tag, key_path):
-    """Sign the card image attached to release `tag` by the image workflow."""
+    """Sign the card images attached to release `tag` by the image workflow.
+
+    Normal and read-only each get their own manifest. An image whose current
+    manifest already vouches for its checksum is left alone, so adding the
+    read-only image never rewrites the normal one's signature.
+    """
     import tempfile
+    done = 0
     with tempfile.TemporaryDirectory() as tmp:
-        got = subprocess.run(["gh", "release", "download", tag, "--repo", REPO, "--pattern", "image-info.json",
-                              "--dir", tmp])
-        if got.returncode != 0:
-            sys.exit(f"No image-info.json on {tag} yet: the Station image workflow builds it in about 5 minutes "
-                     f"after the release (gh run list --repo {REPO} --workflow station-image.yml).")
-        info = json.load(open(os.path.join(tmp, "image-info.json")))
-    if f"v{info['version']}" != tag:
-        sys.exit(f"image-info.json is for {info['version']}, not {tag}")
-    manifest = json.dumps({
+        subprocess.run(["gh", "release", "download", tag, "--repo", REPO, "--dir", tmp, "--clobber",
+                        "--pattern", "image-info*.json", "--pattern", "manifest-image*.json"],
+                       capture_output=True)
+        for suffix, variant in IMAGE_VARIANTS.items():
+            path = os.path.join(tmp, f"image-info{suffix}.json")
+            if not os.path.exists(path):
+                continue
+            info = json.load(open(path))
+            if f"v{info['version']}" != tag:
+                sys.exit(f"{os.path.basename(path)} is for {info['version']}, not {tag}")
+            done += 1
+            signed = os.path.join(tmp, f"manifest-image{suffix}.json")
+            if os.path.exists(signed) and \
+                    json.load(open(signed)).get("image_download_sha256") == info["image_download_sha256"]:
+                print(f"already signed: {info['file']}")
+                continue
+            sign_one_image(tag, key_path, info, suffix, variant)
+    if not done:
+        sys.exit(f"No image-info.json on {tag} yet: the Station image workflow builds it in about 5 minutes "
+                 f"after the release (gh run list --repo {REPO} --workflow station-image.yml).")
+
+
+def sign_one_image(tag, key_path, info, suffix, variant):
+    body = {
         "name": f"{NAME}-image",
         "version": info["version"],
         "commit": info["commit"],
@@ -81,17 +104,21 @@ def sign_image(tag, key_path):
         "init_format": info["init_format"],
         "base_image": info["base_image"],
         "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-    }, indent=2) + "\n"
+    }
+    if variant:
+        body["variant"] = variant
+    manifest = json.dumps(body, indent=2) + "\n"
     key = load_key(key_path)
     signature = base64.b64encode(key.sign(IMAGE_CONTEXT + manifest.encode())).decode()
     dist = os.path.join(ROOT, "dist")
     os.makedirs(dist, exist_ok=True)
-    open(os.path.join(dist, "manifest-image.json"), "w").write(manifest)
-    open(os.path.join(dist, "manifest-image.sig"), "w").write(signature + "\n")
+    mpath = os.path.join(dist, f"manifest-image{suffix}.json")
+    spath = os.path.join(dist, f"manifest-image{suffix}.sig")
+    open(mpath, "w").write(manifest)
+    open(spath, "w").write(signature + "\n")
     print(manifest)
-    subprocess.run(["gh", "release", "upload", tag, "--repo", REPO, "--clobber",
-                    os.path.join(dist, "manifest-image.json"), os.path.join(dist, "manifest-image.sig")], check=True)
-    print(f"signed image of {tag}")
+    subprocess.run(["gh", "release", "upload", tag, "--repo", REPO, "--clobber", mpath, spath], check=True)
+    print(f"signed {info['file']} of {tag}")
 
 
 def main():

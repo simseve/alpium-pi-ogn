@@ -17,7 +17,8 @@
 # A station flashed with it claims at first boot and waits for an admin's
 # approval in Alpium; nothing secret is in the image.
 #
-# READ_ONLY=1 builds the read-only variant, named *-readonly: a third
+# READ_ONLY=1 builds the read-only variant, named *-readonly (with its own
+# image-info-readonly.json): a third
 # partition (ext4, label alpium-data, DATA_MB) holds the station's own state,
 # the first-boot resize is removed (it would run into that partition, so the
 # rest of a larger card stays unused), and the root locks itself after
@@ -131,6 +132,7 @@ losetup -d "$LOOP"; LOOP=""
 
 echo "== Compress"
 NAME=alpium-ogn-station-$VERSION$SUFFIX.img
+INFO=image-info$SUFFIX.json
 EXTRACT_SIZE=$(stat -c %s "$IMG")
 EXTRACT_SHA=$(sha256sum "$IMG" | cut -d' ' -f1)
 mv "$IMG" "$WORK/$NAME"
@@ -146,6 +148,6 @@ jq -n --arg version "$VERSION" --arg file "$NAME.xz" --arg base "$BASE_URL" --ar
       '{version: $version, file: $file, commit: $commit, base_image: $base, init_format: $init,
         extract_size: $extract_size, extract_sha256: $extract_sha256,
         image_download_size: $download_size, image_download_sha256: $download_sha256}' \
-      > "$OUT/image-info.json"
-cat "$OUT/image-info.json"
+      > "$OUT/$INFO"
+cat "$OUT/$INFO"
 echo "Done: $OUT/$NAME.xz"

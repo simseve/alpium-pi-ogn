@@ -352,12 +352,26 @@ Files: `~hfss/.ogn_credentials.json` (0600, this station's credentials),
 `~hfss/rtlsdr-ogn/Template.conf` (receiver settings, written by the UI from
 `ogn/Template.conf.in`), `/etc/alpium-ogn/firewall.nft`.
 
-## Read-only stations (test image, not released)
+## Read-only stations (beta)
 
-`READ_ONLY=1 tools/build-image.sh` builds `alpium-ogn-station-X.Y.Z-readonly.img.xz`.
-The release workflow does not set it, so released images and field stations
-are unchanged. No `install.sh` run on a station without
+`READ_ONLY=1 tools/build-image.sh` builds `alpium-ogn-station-X.Y.Z-readonly.img.xz`
+and `image-info-readonly.json`. The workflow builds it beside the normal image
+and `--sign-image` signs each with its own manifest
+(`manifest-image-readonly.json`, carrying `"variant": "readonly"`). Alpium
+offers it in Imager as a second entry.
+
+An update never makes a station read-only: the `/data` partition exists only
+on a card flashed with this image. No `install.sh` run on a station without
 `/etc/alpium-ogn/read-only` does any of this.
+
+To add the read-only image to a release that is already signed, build only
+that one, because a rebuilt normal image gets a new checksum and its signature
+stops matching:
+
+```bash
+gh workflow run station-image.yml --repo simseve/alpium-pi-ogn -f tag=vX.Y.Z -f variant=readonly
+$PY tools/make-release.py --sign-image vX.Y.Z   # leaves the normal image's signature alone
+```
 
 - **Layout**: boot, root (fixed size), and `/data` (ext4, label `alpium-data`,
   256 MB). The first-boot `resize` word is removed from `cmdline.txt`, because

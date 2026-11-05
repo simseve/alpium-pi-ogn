@@ -12,6 +12,10 @@ on:
       tag:
         description: Release tag to build the image for (vX.Y.Z)
         required: true
+      variant:
+        description: all, normal or readonly. A rebuilt image has a new checksum, so sign it again; use readonly to add that image to a release without touching its signed normal image.
+        required: false
+        default: all
 
 permissions:
   contents: write
@@ -34,9 +38,13 @@ jobs:
       - name: Tools
         run: sudo apt-get update -q && sudo apt-get install -y -q jq xz-utils parted e2fsprogs
       - name: Build
+        if: ${{ github.event_name == 'release' || inputs.variant != 'readonly' }}
         run: sudo SRC="$PWD/src" build/tools/build-image.sh dist
+      - name: Build read-only
+        if: ${{ github.event_name == 'release' || inputs.variant != 'normal' }}
+        run: sudo READ_ONLY=1 SRC="$PWD/src" build/tools/build-image.sh dist
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: gh release upload "$TAG" dist/*.img.xz dist/image-info.json --clobber --repo "${{ github.repository }}"
+        run: gh release upload "$TAG" dist/*.img.xz dist/image-info*.json --clobber --repo "${{ github.repository }}"
