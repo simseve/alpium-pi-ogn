@@ -17,6 +17,12 @@
 # A station flashed with it claims at first boot and waits for an admin's
 # approval in Alpium; nothing secret is in the image.
 #
+# READ_ONLY=1 builds the read-only variant, named *-readonly: a third
+# partition (ext4, label alpium-data, DATA_MB) holds the station's own state,
+# the first-boot resize is removed (it would run into that partition, so the
+# rest of a larger card stays unused), and the root locks itself after
+# approval.
+#
 # Must run as root on an arm64 Linux machine (GitHub's ubuntu-24.04-arm
 # runner): install.sh runs natively in the chroot, no emulation.
 set -euo pipefail
@@ -24,6 +30,10 @@ set -euo pipefail
 OUT=${1:-dist}
 OS_LIST=https://downloads.raspberrypi.com/os_list_imagingutility_v4.json
 GROW_MB=1536
+DATA_MB=256
+READ_ONLY=${READ_ONLY:-0}
+SUFFIX=""
+[ "$READ_ONLY" != 1 ] || SUFFIX=-readonly
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root"
@@ -43,7 +53,7 @@ MNT=$WORK/root
 LOOP=""
 cleanup() {
   set +e
-  for m in "$MNT/dev/pts" "$MNT/dev" "$MNT/proc" "$MNT/sys" "$MNT/boot/firmware" "$MNT"; do
+  for m in "$MNT/dev/pts" "$MNT/dev" "$MNT/proc" "$MNT/sys" "$MNT/data" "$MNT/boot/firmware" "$MNT"; do
     mountpoint -q "$m" && umount -l "$m"
   done
   [ -n "$LOOP" ] && losetup -d "$LOOP"
@@ -74,6 +84,11 @@ echo "$BASE_EXTRACT_SHA  $IMG" | sha256sum -c --quiet || die "base image does no
 echo "== Grow the root partition by ${GROW_MB} MB"
 truncate -s +"${GROW_MB}M" "$IMG"
 parted -s "$IMG" resizepart 2 100%
+if [ "$READ_ONLY" = 1 ]; then
+  ROOT_END=$(parted -sm "$IMG" unit s print | awk -F: '$1==2{print $3+0}')
+  truncate -s +"${DATA_MB}M" "$IMG"
+  parted -s "$IMG" mkpart primary ext4 "$((ROOT_END + 1))s" 100%
+fi
 LOOP=$(losetup -fP --show "$IMG")
 e2fsck -pf "${LOOP}p2" || true
 resize2fs "${LOOP}p2"
@@ -82,6 +97,15 @@ echo "== Install the station software in a chroot"
 mkdir -p "$MNT"
 mount "${LOOP}p2" "$MNT"
 mount "${LOOP}p1" "$MNT/boot/firmware"
+INSTALL_ARGS=--image
+if [ "$READ_ONLY" = 1 ]; then
+  mkfs.ext4 -q -L alpium-data -m 0 "${LOOP}p3"
+  mkdir -p "$MNT/data"
+  mount "${LOOP}p3" "$MNT/data"
+  # The word "resize" grows partition 2 to the end of the card.
+  sed -i 's/ resize\b//' "$MNT/boot/firmware/cmdline.txt"
+  INSTALL_ARGS="--image --read-only"
+fi
 mount --bind /dev "$MNT/dev"
 mount --bind /dev/pts "$MNT/dev/pts"
 mount -t proc proc "$MNT/proc"
@@ -89,20 +113,24 @@ mount -t sysfs sys "$MNT/sys"
 cp --remove-destination /etc/resolv.conf "$MNT/etc/resolv.conf"
 mkdir -p "$MNT/tmp/station-src"
 git -c safe.directory="$REPO" -C "$REPO" archive HEAD | tar -x -C "$MNT/tmp/station-src"
-chroot "$MNT" /bin/bash /tmp/station-src/install.sh --image
+# shellcheck disable=SC2086
+chroot "$MNT" /bin/bash /tmp/station-src/install.sh $INSTALL_ARGS
 chroot "$MNT" /bin/bash -c 'apt-get clean; rm -rf /var/lib/apt/lists/* /tmp/station-src'
 # The image's resolv.conf is NetworkManager's to write at first boot.
 rm -f "$MNT/etc/resolv.conf"
 ln -s ../run/NetworkManager/resolv.conf "$MNT/etc/resolv.conf"
 cleanup_mounts() {
-  for m in "$MNT/dev/pts" "$MNT/dev" "$MNT/proc" "$MNT/sys" "$MNT/boot/firmware" "$MNT"; do umount "$m"; done
+  for m in "$MNT/dev/pts" "$MNT/dev" "$MNT/proc" "$MNT/sys" "$MNT/boot/firmware"; do umount "$m"; done
+  if mountpoint -q "$MNT/data"; then umount "$MNT/data"; fi
+  umount "$MNT"
 }
 cleanup_mounts
 e2fsck -pf "${LOOP}p2" || true
+if [ "$READ_ONLY" = 1 ]; then e2fsck -pf "${LOOP}p3" || true; fi
 losetup -d "$LOOP"; LOOP=""
 
 echo "== Compress"
-NAME=alpium-ogn-station-$VERSION.img
+NAME=alpium-ogn-station-$VERSION$SUFFIX.img
 EXTRACT_SIZE=$(stat -c %s "$IMG")
 EXTRACT_SHA=$(sha256sum "$IMG" | cut -d' ' -f1)
 mv "$IMG" "$WORK/$NAME"

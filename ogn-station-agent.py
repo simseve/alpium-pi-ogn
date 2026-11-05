@@ -49,22 +49,31 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-AGENT_VERSION = "3.3.6"
+AGENT_VERSION = "3.3.7"
 
 HOME = os.environ.get("ALPIUM_OGN_HOME", "/home/hfss")
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+# Where this station's own state lives. On a read-only image that is the
+# persistent /data partition (set in /etc/default/alpium-ogn-station), because
+# anything under the overlaid root is gone at the next boot. These stay plain
+# paths, never symlinks: os.replace would swap the link itself and the new
+# file would land in RAM.
+STATE_HOME = os.environ.get("ALPIUM_OGN_STATE", HOME)
 CONFIG_FILE = os.environ.get("OGN_TEMPLATE_CONF", os.path.join(HOME, "rtlsdr-ogn", "Template.conf"))
 TEMPLATE_IN = os.path.join(REPO_DIR, "ogn", "Template.conf.in")
-CREDENTIALS_FILE = os.path.join(HOME, ".ogn_credentials.json")
-CLAIM_KEY_FILE = os.path.join(HOME, ".ogn_claim_key")
+CREDENTIALS_FILE = os.path.join(STATE_HOME, ".ogn_credentials.json")
+CLAIM_KEY_FILE = os.path.join(STATE_HOME, ".ogn_claim_key")
 CLAIM_URL_FILE = "/etc/alpium-ogn/enroll-base"
 DEFAULT_ENROLL_BASE = "https://app.alpium.io/api/v1"
 CLAIM_INTERVAL = 60
 AUTHORIZED_KEYS = os.path.join(HOME, ".ssh", "authorized_keys")
-HEARTBEAT_LOG_FILE = os.path.join(HOME, ".ogn_heartbeat_log.json")
+# In RAM: rewritten every heartbeat, and Alpium keeps the history anyway.
+HEARTBEAT_LOG_FILE = os.environ.get("ALPIUM_OGN_HEARTBEAT_LOG", "/run/alpium-ogn/heartbeat-log.json")
 HELPER = "/usr/local/sbin/alpium-ogn-helper"
 UPDATE_STATE = "/var/lib/alpium-ogn/update-state.json"
-UPDATE_LOG = "/var/log/alpium-ogn-update.log"
+UPDATE_LOG = "/var/lib/alpium-ogn/update.log"
+READ_ONLY_MARKER = "/etc/alpium-ogn/read-only"
+ROOT_LOWER = "/media/root-ro"
 
 LISTEN_PORT = 8082
 DEFAULT_HEARTBEAT_INTERVAL = 300
@@ -162,7 +171,8 @@ def station_status():
     except (OSError, ValueError):
         status["uptime"] = None
     try:
-        du = shutil.disk_usage("/")
+        # On a locked root "/" is the RAM overlay; the card is the lower layer.
+        du = shutil.disk_usage(ROOT_LOWER if os.path.ismount(ROOT_LOWER) else "/")
         status["disk_usage_percent"] = round(du.used / du.total * 100, 1)
     except OSError:
         status["disk_usage_percent"] = None
@@ -489,6 +499,51 @@ def led_loop():
         time.sleep(LED_INTERVAL)
 
 
+def root_is_overlay():
+    try:
+        with open("/proc/mounts") as f:
+            roots = [line.split()[2] for line in f if line.split()[1] == "/"]
+        return bool(roots) and roots[-1] == "overlay"
+    except (OSError, IndexError):
+        return False
+
+
+def read_sys(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def storage_info():
+    """What the card is going through, for /v1/health (local). Not in the
+    heartbeat: Alpium's schema refuses keys it does not know yet."""
+    info = {"root": "read-only" if root_is_overlay() else "writable",
+            "read_only_image": os.path.exists(READ_ONLY_MARKER), "filesystems": {}}
+    try:
+        names = sorted(os.listdir("/sys/fs/ext4"))
+    except OSError:
+        names = []
+    for name in names:
+        if name == "features":
+            continue
+        base = f"/sys/fs/ext4/{name}/"
+        info["filesystems"][name] = {key: read_sys(base + key) for key in (
+            "session_write_kbytes", "lifetime_write_kbytes", "errors_count")}
+    stat = read_sys("/sys/block/mmcblk0/stat")
+    if stat:
+        info["card_mb_written_since_boot"] = round(int(stat.split()[6]) * 512 / 1048576, 1)
+    info["card"] = {key: read_sys(f"/sys/block/mmcblk0/device/{key}") for key in ("name", "manfid", "oemid")}
+    try:
+        for hw in os.listdir("/sys/class/hwmon"):
+            if read_sys(f"/sys/class/hwmon/{hw}/name") == "rpi_volt":
+                info["under_voltage_since_boot"] = read_sys(f"/sys/class/hwmon/{hw}/in0_lcrit_alarm") == "1"
+    except OSError:
+        pass
+    return info
+
+
 def heartbeat_body():
     """What a heartbeat says: the fields Alpium's StationHeartbeat accepts."""
     config = read_config()
@@ -734,6 +789,7 @@ def heartbeat_loop():
                 except Exception as e:
                     print(f"Hostname error: {e}", flush=True)
                 send_heartbeat(creds)
+                maybe_lock_root()
             else:
                 interval = CLAIM_INTERVAL
                 enrollment = claim_once()
@@ -748,6 +804,17 @@ def heartbeat_loop():
         time.sleep(max(5, interval))
 
 
+def maybe_lock_root():
+    """A read-only image stays writable through first boot (claim, tailnet,
+    name) and locks itself once all of that worked. The helper refuses while
+    an update runs or after someone unlocked the station by hand."""
+    if not os.path.exists(READ_ONLY_MARKER) or root_is_overlay():
+        return
+    if heartbeat_state.get("last_error") or not heartbeat_state.get("last_ok") or not get_tailscale_ip():
+        return
+    print("Root lock:", helper("root-autolock").get("message"), flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Control API
 # ---------------------------------------------------------------------------
@@ -757,7 +824,7 @@ def h_health(_body):
     creds = load_credentials()
     return 200, {"status": "ok", "agent_version": AGENT_VERSION, "serial": get_serial(),
                  "enrolled": bool(creds), "device_id": creds["device_id"] if creds else None,
-                 "claim": None if creds else dict(claim_state)}
+                 "claim": None if creds else dict(claim_state), "storage": storage_info()}
 
 
 def h_status(_body):

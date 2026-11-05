@@ -20,6 +20,9 @@
 #   --image                prepare a station card image (run in a chroot by
 #                          tools/build-image.sh): install everything, enroll
 #                          nothing, start nothing
+#   --read-only            with --image: a card whose root locks itself after
+#                          approval, state on a /data partition that
+#                          tools/build-image.sh (READ_ONLY=1) has mounted
 #   --callsign CALL        OGN receiver name, 3-9 letters/digits
 #   --lat/--lon/--alt N    antenna position (degrees, metres AMSL)
 #   --name NAME            station name shown in Alpium (default: callsign)
@@ -47,7 +50,7 @@ OGN_SHA_EGM=9dcaf4efd6857aaa2e1e2e2c574d3f5264eacf47024cdcd5291c40ddad5e5acc
 
 CODE=${OGN_ENROLL_CODE:-}
 CALLSIGN="" LAT="" LON="" ALT="" NAME=""
-LAN_SSH=1 HARDEN_SSH=1 SKIP_OGN=0 IMAGE=0
+LAN_SSH=1 HARDEN_SSH=1 SKIP_OGN=0 IMAGE=0 READ_ONLY=0
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 step() { echo; echo "== $*"; }
@@ -65,7 +68,8 @@ while [ $# -gt 0 ]; do
     --keep-ssh-passwords) HARDEN_SSH=0; shift ;;
     --skip-ogn) SKIP_OGN=1; shift ;;
     --image) IMAGE=1; shift ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --read-only) READ_ONLY=1; shift ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
@@ -74,6 +78,7 @@ done
 # A choice made once with an option stays made: an update (signed release,
 # run with no options) must not reopen LAN SSH or turn passwords back off.
 [ -f /etc/alpium-ogn/no-lan-ssh ] && LAN_SSH=0
+[ -f /etc/alpium-ogn/read-only ] && READ_ONLY=1
 [ -f /etc/alpium-ogn/keep-ssh-passwords ] && HARDEN_SSH=0
 install -d -m 0755 /etc/alpium-ogn
 if [ "$LAN_SSH" -eq 0 ]; then touch /etc/alpium-ogn/no-lan-ssh; fi
@@ -99,7 +104,15 @@ case "$DIST" in
   *) die "needs Raspberry Pi OS based on Debian 13 (Trixie) or 12 (Bookworm); this is Debian ${DIST:-unknown}" ;;
 esac
 BITS=$(getconf LONG_BIT)
-CREDS=$AGENT_HOME/.ogn_credentials.json
+# A read-only image keeps this station's own state on /data: the root is
+# overlaid and anything else is gone at the next boot.
+DATA=/data
+STATE_HOME=$AGENT_HOME
+if [ "$READ_ONLY" -eq 1 ]; then
+  mountpoint -q "$DATA" || die "a read-only image needs the data partition mounted at $DATA"
+  STATE_HOME=$DATA/hfss
+fi
+CREDS=$STATE_HOME/.ogn_credentials.json
 if [ -n "$CALLSIGN" ] && ! [[ "$CALLSIGN" =~ ^[A-Za-z0-9]{3,9}$ ]]; then
   die "callsign must be 3-9 letters or digits"
 fi
@@ -126,6 +139,16 @@ if [ "$SRC" != "$TARGET" ]; then
   cp -a "$SRC/." "$TARGET/"
 fi
 chown -R "$AGENT_USER:$AGENT_USER" "$TARGET"
+rm -f "$AGENT_HOME/.ogn_heartbeat_log.json"   # in RAM since 3.3.7
+if [ "$READ_ONLY" -eq 1 ]; then
+  install -d -o "$AGENT_USER" -g "$AGENT_USER" -m 0700 "$STATE_HOME" "$DATA/ssh-hfss"
+  install -d -o root -g root -m 0700 "$DATA/tailscale" "$DATA/nm-connections"
+  install -d -o root -g root -m 0755 "$DATA/alpium-ogn"
+  cat > /etc/default/alpium-ogn-station <<ENV
+ALPIUM_OGN_STATE=$STATE_HOME
+OGN_TEMPLATE_CONF=$STATE_HOME/Template.conf
+ENV
+fi
 # The old provisioning wrote the fleet's shared secrets here. Nothing reads
 # them any more; they must not stay on a device in the field.
 for old in "$TARGET/.env" "$SRC/.env"; do
@@ -211,6 +234,7 @@ fi
 # The receiver config: written from the template on first install, then
 # owned by the station UI. Position and callsign from the command line win.
 CONF=$AGENT_HOME/rtlsdr-ogn/Template.conf
+[ "$READ_ONLY" -eq 0 ] || CONF=$STATE_HOME/Template.conf
 if [ ! -f "$CONF" ] || ! grep -q "Alpium station agent" "$CONF" || [ -n "$CALLSIGN$LAT$LON$ALT" ]; then
   sudo -u "$AGENT_USER" python3 - "$TARGET" "$CONF" "${CALLSIGN}" "${LAT}" "${LON}" "${ALT}" <<'PY'
 import re
@@ -236,6 +260,8 @@ agent.write_config(cfg)
 print("   receiver configured as", cfg["call"], cfg["latitude"], cfg["longitude"], cfg["altitude"])
 PY
 fi
+# ogn-rf opens ./Template.conf; the agent writes the real file on /data.
+[ "$READ_ONLY" -eq 0 ] || ln -sfn "$CONF" "$AGENT_HOME/rtlsdr-ogn/Template.conf"
 install -m 0644 "$TARGET/system/rtlsdr-ogn.service" /etc/systemd/system/rtlsdr-ogn.service
 rm -f /etc/init.d/rtlsdr-ogn
 
@@ -400,8 +426,36 @@ install -m 0644 "$TARGET/system/alpium-ogn-station.service" /etc/systemd/system/
 # The green light for the person on site (agent 3.3.5).
 install -o root -g root -m 0755 "$TARGET/system/alpium-ogn-led" /usr/local/sbin/alpium-ogn-led
 install -m 0644 "$TARGET/system/alpium-ogn-led.service" /etc/systemd/system/alpium-ogn-led.service
+if [ "$READ_ONLY" -eq 1 ]; then
+  install -m 0644 "$TARGET/system/alpium-ogn-boot-ro.service" /etc/systemd/system/alpium-ogn-boot-ro.service
+  install -m 0644 "$TARGET/system/alpium-ogn-update-resume.service" /etc/systemd/system/alpium-ogn-update-resume.service
+  install -d -m 0755 /etc/systemd/system.conf.d /etc/rpi/swap.conf.d
+  # The Pi's hardware watchdog: a hung station reboots itself, safe on a
+  # read-only root, instead of waiting for a site visit.
+  printf '[Manager]\nRuntimeWatchdogSec=15\n' > /etc/systemd/system.conf.d/alpium-watchdog.conf
+  # Tailscale's log buffer sits beside its state, on /data, and is written
+  # for as long as it runs. In RAM it is lost at reboot; the state stays.
+  grep -q '^TS_LOGS_DIR=' /etc/default/tailscaled 2>/dev/null || echo 'TS_LOGS_DIR=/run/tailscale' >> /etc/default/tailscaled
+  # Compressed swap in RAM only, never a swap file on the card.
+  printf '[Main]\nMechanism=zram\n' > /etc/rpi/swap.conf.d/alpium.conf
+  if [ "$IMAGE" -eq 1 ]; then
+    systemctl mask apt-daily.timer apt-daily-upgrade.timer man-db.timer dpkg-db-backup.timer e2scrub_all.timer fstrim.timer
+    apt-get install -y -q overlayroot
+    install -d -m 0700 /var/lib/tailscale   # mount point of the bind below
+    grep -q ' /data ' /etc/fstab || cat >> /etc/fstab <<FSTAB
+LABEL=alpium-data /data ext4 defaults,noatime,nofail,x-systemd.device-timeout=30s 0 2
+$DATA/tailscale /var/lib/tailscale none bind,nofail 0 0
+$DATA/nm-connections /etc/NetworkManager/system-connections none bind,nofail 0 0
+$DATA/ssh-hfss $AGENT_HOME/.ssh none bind,nofail 0 0
+$DATA/alpium-ogn /var/lib/alpium-ogn none bind,nofail 0 0
+FSTAB
+    update-initramfs -u -k all
+  fi
+  touch /etc/alpium-ogn/read-only
+fi
 systemctl daemon-reload
 systemctl enable alpium-ogn-firewall rtlsdr-ogn alpium-ogn-station alpium-ogn-led ModemManager
+if [ "$READ_ONLY" -eq 1 ]; then systemctl enable alpium-ogn-boot-ro alpium-ogn-update-resume; fi
 
 AGENT_VER=$(sed -n 's/^AGENT_VERSION = "\([0-9.]*\)"$/\1/p' "$TARGET/ogn-station-agent.py")
 echo "$AGENT_VER" > /etc/alpium-ogn/version

@@ -1,0 +1,14 @@
+# Read-only image: on a locked root the FAT boot partition stays read-only
+# too. The helper remounts it only to choose the next boot.
+[Unit]
+Description=Alpium OGN station: boot partition read-only while the root is locked
+ConditionPathIsMountPoint=/media/root-ro
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/mount -o remount,ro /boot/firmware
+
+[Install]
+WantedBy=multi-user.target

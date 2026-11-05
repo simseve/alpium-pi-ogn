@@ -22,6 +22,16 @@ Everything else, from the Tailscale policy to retiring a lost station, is in
 [PRODUCTION-DEPLOYMENT.md](PRODUCTION-DEPLOYMENT.md), including the release
 runbook (*Releasing a new version*: publish, image, sign).
 
+> **Read-only image (test, not released).** `READ_ONLY=1` on `tools/build-image.sh`
+> builds a card whose root locks itself after approval, with the station's state on a
+> `/data` partition. Symptom if `/data` is mounted through overlayroot's default
+> `recurse=1`: settings look saved and vanish at reboot. See *Read-only stations* in
+> PRODUCTION-DEPLOYMENT.md.
+>
+> **Building it on a Mac.** Docker Desktop on Apple silicon is arm64, so the script
+> runs natively in a `--privileged` `ubuntu:24.04` container. Mount `devtmpfs` on `/dev`
+> first, or `losetup -P` creates no partition nodes.
+
 ## Layout
 
 | Path | What |

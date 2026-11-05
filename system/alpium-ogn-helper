@@ -32,6 +32,14 @@ must not be able to turn a request into an arbitrary root command.
                                its own (unit alpium-ogn-update)
   apply-update                 that job: download, check, install (run by
                                systemd, not by the agent)
+  root-status                  read-only image: is the root locked
+  root-lock                    lock the root and reboot
+  root-unlock                  boot writable and STAY writable until
+                               root-lock (for maintenance over SSH)
+  root-autolock                the agent, once enrolled: lock unless someone
+                               unlocked by hand or an update is under way
+  root-apply lock|unlock       that job, in a unit of its own (the agent's
+                               sandbox cannot write /boot/firmware)
 
 Releases are signed OFFLINE with the release key (tools/make-release.py);
 its public half is /etc/alpium-ogn/release.pub. Neither the agent nor Alpium
@@ -64,7 +72,16 @@ VERSION_FILE = "/etc/alpium-ogn/version"
 STATE_DIR = "/var/lib/alpium-ogn"
 PENDING_RELEASE = STATE_DIR + "/pending-release.json"
 UPDATE_STATE = STATE_DIR + "/update-state.json"
-UPDATE_LOG = "/var/log/alpium-ogn-update.log"
+UPDATE_LOG = STATE_DIR + "/update.log"
+READ_ONLY_MARKER = "/etc/alpium-ogn/read-only"
+BOOT_DIR = "/boot/firmware"
+CMDLINE = BOOT_DIR + "/cmdline.txt"
+# recurse=0 or overlayroot overlays every other fstab mount too, and writes
+# to /data would go to RAM while looking persistent.
+OVERLAY_ARG = "overlayroot=tmpfs:recurse=0"
+STAY_UNLOCKED = STATE_DIR + "/stay-unlocked"
+RELOCK_AFTER_UPDATE = STATE_DIR + "/relock-after-update"
+ROOT_UNIT = "alpium-ogn-root"
 RELEASES_DIR = "/opt/alpium-ogn/releases"
 RELEASES_KEEP = 3
 UPDATE_UNIT = "alpium-ogn-update"
@@ -253,6 +270,54 @@ def safe_members(tar, root):
     return tar.getmembers()
 
 
+def read_only_image():
+    return os.path.exists(READ_ONLY_MARKER) and os.path.ismount("/data")
+
+
+def root_locked():
+    return run("findmnt", "-n", "-o", "FSTYPE", "/").stdout.strip() == "overlay"
+
+
+def set_overlay(on):
+    """Choose what the next boot is. /boot/firmware is mounted read-only on a
+    locked root; the reboot that follows puts that back."""
+    if run("mount", "-o", "remount,rw", BOOT_DIR).returncode != 0:
+        raise RuntimeError("could not remount the boot partition")
+    with open(CMDLINE) as f:
+        words = [w for w in f.read().split() if not w.startswith("overlayroot=")]
+    if on:
+        words.insert(0, OVERLAY_ARG)
+    with open(CMDLINE + ".new", "w") as f:
+        f.write(" ".join(words) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(CMDLINE + ".new", CMDLINE)
+    os.sync()
+
+
+def start_root_job(action):
+    r = run("systemd-run", f"--unit={ROOT_UNIT}", "--collect", "--quiet", "--", HELPER_PATH, "root-apply", action)
+    if r.returncode != 0:
+        fail("Could not start the job: " + (r.stderr or "").strip()[:200])
+
+
+def update_under_way():
+    return (os.path.exists(PENDING_RELEASE) or os.path.exists(RELOCK_AFTER_UPDATE)
+            or run("systemctl", "is-active", "--quiet", UPDATE_UNIT).returncode == 0)
+
+
+def touch(path):
+    with open(path, "w"):
+        pass
+
+
+def forget(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def apply_update():
     try:
         with open(PENDING_RELEASE) as f:
@@ -265,6 +330,18 @@ def apply_update():
         write_state(state="failed", error="pending release did not verify")
         raise
     version, current = m["version"], installed_version()
+    if root_locked():
+        # install.sh into a RAM overlay would vanish at the next boot and the
+        # version with it. Boot writable, install there, lock again. The
+        # pending release survives on /data; a failed install stays writable.
+        log(f"== update {current} -> {version}: root is read-only, rebooting writable")
+        touch(RELOCK_AFTER_UPDATE)
+        set_overlay(False)
+        run("systemctl", "reboot")
+        ok("Rebooting writable to install")
+    if os.path.exists(RELOCK_AFTER_UPDATE):
+        # Just booted: TLS needs the network and a clock that has been set.
+        subprocess.run(["chronyc", "waitsync", "30", "0", "0", "10"], capture_output=True, timeout=330)
     write_state(state="running", version=version, previous=current)
     log(f"== update {current} -> {version} ({m.get('commit', '')[:12]})")
     try:
@@ -304,6 +381,9 @@ def apply_update():
     except Exception as e:
         log(f"FAILED: {e}")
         write_state(state="failed", version=version, previous=current, error=str(e)[:300])
+        if os.path.exists(RELOCK_AFTER_UPDATE):
+            touch(STAY_UNLOCKED)
+            forget(RELOCK_AFTER_UPDATE)
         fail(str(e))
     finally:
         try:
@@ -315,6 +395,11 @@ def apply_update():
         shutil.rmtree(os.path.join(RELEASES_DIR, old), ignore_errors=True)
     log(f"done: {version}")
     write_state(state="done", version=version, previous=current)
+    if os.path.exists(RELOCK_AFTER_UPDATE):
+        log("locking the root again")
+        forget(RELOCK_AFTER_UPDATE)
+        set_overlay(True)
+        run("systemctl", "reboot")
     ok(f"Updated to {version}")
 
 
@@ -600,6 +685,37 @@ def main(argv):
     if not argv:
         fail("No command")
     cmd, args = argv[0], argv[1:]
+
+    if cmd == "root-status" and not args:
+        ok("Root status", supported=read_only_image(), locked=root_locked(),
+           stay_unlocked=os.path.exists(STAY_UNLOCKED))
+
+    if cmd in ("root-lock", "root-unlock", "root-autolock") and not args:
+        if not read_only_image():
+            fail("Not a read-only image")
+        if cmd == "root-unlock":
+            touch(STAY_UNLOCKED)
+            if not root_locked():
+                ok("Already writable, and will stay so until root-lock")
+            start_root_job("unlock")
+            ok("Rebooting writable")
+        if root_locked():
+            ok("Already locked")
+        if update_under_way():
+            fail("An update is under way")
+        if cmd == "root-autolock" and os.path.exists(STAY_UNLOCKED):
+            ok("Left writable by hand")
+        forget(STAY_UNLOCKED)
+        start_root_job("lock")
+        ok("Locking the root and rebooting")
+
+    if cmd == "root-apply" and args in (["lock"], ["unlock"]):
+        try:
+            set_overlay(args[0] == "lock")
+        except (OSError, RuntimeError) as e:
+            fail(str(e))
+        run("systemctl", "reboot")
+        ok("Rebooting")
 
     if cmd == "restart-ogn" and not args:
         r = run("systemctl", "restart", OGN_SERVICE)

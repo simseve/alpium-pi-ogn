@@ -352,6 +352,41 @@ Files: `~hfss/.ogn_credentials.json` (0600, this station's credentials),
 `~hfss/rtlsdr-ogn/Template.conf` (receiver settings, written by the UI from
 `ogn/Template.conf.in`), `/etc/alpium-ogn/firewall.nft`.
 
+## Read-only stations (test image, not released)
+
+`READ_ONLY=1 tools/build-image.sh` builds `alpium-ogn-station-X.Y.Z-readonly.img.xz`.
+The release workflow does not set it, so released images and field stations
+are unchanged. No `install.sh` run on a station without
+`/etc/alpium-ogn/read-only` does any of this.
+
+- **Layout**: boot, root (fixed size), and `/data` (ext4, label `alpium-data`,
+  256 MB). The first-boot `resize` word is removed from `cmdline.txt`, because
+  it would grow the root into `/data`, so the rest of a larger card stays
+  unused, and every card of a batch keeps the same disk id.
+- **What lives on `/data`**: `hfss/` (credentials, claim key, `Template.conf`,
+  paths set in `/etc/default/alpium-ogn-station`, never symlinks because
+  `os.replace` would swap the link), and bind mounts for `/var/lib/tailscale`,
+  `/etc/NetworkManager/system-connections`, `~hfss/.ssh`, `/var/lib/alpium-ogn`.
+- **Locking**: first boot is writable. After enrollment, the tailnet and an
+  accepted heartbeat, the agent asks the helper to lock: `overlayroot=tmpfs:recurse=0`
+  goes in `cmdline.txt` and the Pi reboots. `recurse=0` is not optional: the
+  default overlays `/data` too and persistent writes land in RAM.
+- **By hand, over SSH**:
+  ```bash
+  sudo alpium-ogn-helper root-status
+  sudo alpium-ogn-helper root-unlock   # reboots writable, stays so
+  sudo alpium-ogn-helper root-lock     # reboots locked
+  curl -s http://127.0.0.1:8082/v1/health | python3 -m json.tool   # "storage": root mode, writes, card, under-voltage
+  ```
+- **Updates**: a signed update on a locked root reboots writable, installs with
+  the ordinary `install.sh`, and locks again. A failed install stays writable.
+- **Also on this image**: Tailscale's log buffer in RAM (`TS_LOGS_DIR=/run/tailscale`,
+  or it is written to `/data` for as long as it runs), hardware watchdog (15 s), swap in RAM only (Pi OS
+  defaults to `zram+file`, which writes to the card), apt, man-db, fstrim and
+  e2scrub timers masked.
+- Anything changed outside `/data` while locked is gone at the next reboot,
+  an `apt install` over SSH included: unlock first.
+
 ## Troubleshooting
 
 ```bash

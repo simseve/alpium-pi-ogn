@@ -1,0 +1,16 @@
+# Read-only image: a signed update on a locked root reboots writable and
+# carries on here. The pending release waited on /data.
+[Unit]
+Description=Alpium OGN station: finish a signed update after the writable reboot
+ConditionPathExists=/var/lib/alpium-ogn/relock-after-update
+RequiresMountsFor=/var/lib/alpium-ogn
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2100
+ExecStart=/usr/local/sbin/alpium-ogn-helper apply-update
+
+[Install]
+WantedBy=multi-user.target
